@@ -1,0 +1,5 @@
+flask
+requests
+pydantic
+google-genai
+pillow
