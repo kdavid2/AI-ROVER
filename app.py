@@ -19,7 +19,6 @@ TURN_PULSE_SECONDS = 0.15
 
 _session = requests.Session()
 
-# Μεταβλητές κατάστασης για το AI Thread
 ai_thread = None
 ai_running = False
 ai_status_log = "Σύστημα έτοιμο..."
@@ -40,6 +39,19 @@ def car(command: str) -> None:
     if command in CAR_VALS:
         control("car", CAR_VALS[command])
 
+def execute_pulse(cmd: str):
+    """Εκτελεί μια μικρή, ελεγχόμενη κίνηση (pulse) και σταματάει αμέσως"""
+    if cmd in ("forward", "backward"):
+        car(cmd)
+        time.sleep(MOVE_PULSE_SECONDS)
+        car("stop")
+    elif cmd in ("left", "right"):
+        car(cmd)
+        time.sleep(TURN_PULSE_SECONDS)
+        car("stop")
+    else:
+        car("stop")
+
 def get_frame() -> bytes:
     try:
         r = _session.get(CAPTURE_URL, timeout=4)
@@ -50,14 +62,13 @@ def get_frame() -> bytes:
         pass
     return b""
 
-# HTML Template με πλήρη υποστήριξη όλων των ρυθμίσεων και λειτουργιών του HTML
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="el">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Full Controls</title>
+    <title>Rover Cloud Control - Pulse Mode</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -115,11 +126,11 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="controls">
-            <button class="btn-up" onmousedown="sendCmd('forward')" onmouseup="sendCmd('stop')" ontouchstart="sendCmd('forward')" ontouchend="sendCmd('stop')">Forward</button>
-            <button class="btn-left" onmousedown="sendCmd('left')" onmouseup="sendCmd('stop')" ontouchstart="sendCmd('left')" ontouchend="sendCmd('stop')">Left</button>
+            <button class="btn-up" onclick="sendCmd('forward')">Forward</button>
+            <button class="btn-left" onclick="sendCmd('left')">Left</button>
             <button class="btn-stop" onclick="sendCmd('stop')">STOP</button>
-            <button class="btn-right" onmousedown="sendCmd('right')" onmouseup="sendCmd('stop')" ontouchstart="sendCmd('right')" ontouchend="sendCmd('stop')">Right</button>
-            <button class="btn-down" onmousedown="sendCmd('backward')" onmouseup="sendCmd('stop')" ontouchstart="sendCmd('backward')" ontouchend="sendCmd('stop')">Backward</button>
+            <button class="btn-right" onclick="sendCmd('right')">Right</button>
+            <button class="btn-down" onclick="sendCmd('backward')">Backward</button>
             <button class="btn-tiltup" onclick="sendControlVar('ltrim', 1)">Tilt Up</button>
             <button class="btn-tiltdown" onclick="sendControlVar('rtrim', 1)">Tilt Down</button>
         </div>
@@ -190,13 +201,11 @@ HTML_TEMPLATE = """
             document.querySelector('.' + tabName + '-tab').classList.remove('hide');
         }
 
-        // Ανανέωση κάμερας κάθε 2 δευτερόλεπτα
         setInterval(() => {
             let img = document.getElementById('camStream');
             if(img) img.src = '/video_feed?' + new Date().getTime();
         }, 2000);
 
-        // Polling για τα logs από τον server κάθε 1 δευτερόλεπτο
         setInterval(() => {
             fetch('/status')
             .then(res => res.json())
@@ -238,8 +247,6 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({var: varName, val: val})
-            }).then(res => res.json()).then(data => {
-                console.log("Control set:", data);
             });
         }
 
@@ -251,21 +258,15 @@ HTML_TEMPLATE = """
             sendControlVar(paramName, val);
         }
 
-        // Υποστήριξη WASD και Βελάκων από το πληκτρολόγιο
+        // Υποστήριξη WASD και Βελάκων από το πληκτρολόγιο (κάθε πάτημα δίνει ένα καθαρό βήμα)
         window.addEventListener('keydown', (e) => {
+            if (e.repeat) return; // Αποφυγή spamming αν κρατηθεί πατημένο
             let k = e.key.toLowerCase();
             if (k === 'w' || e.key === 'ArrowUp') sendCmd('forward');
             else if (k === 's' || e.key === 'ArrowDown') sendCmd('backward');
             else if (k === 'a' || e.key === 'ArrowLeft') sendCmd('left');
             else if (k === 'd' || e.key === 'ArrowRight') sendCmd('right');
             else if (e.key === ' ') { sendCmd('stop'); e.preventDefault(); }
-        });
-
-        window.addEventListener('keyup', (e) => {
-            let k = e.key.toLowerCase();
-            if (['w','s','a','d','arrowup','arrowdown','arrowleft','arrowright'].includes(k) || ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
-                sendCmd('stop');
-            }
         });
 
         function toggleAi() {
@@ -281,7 +282,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# Global buffer για τα logs
 log_lines = ["Σύστημα έτοιμο..."]
 
 def add_log(msg):
@@ -332,17 +332,7 @@ def ai_worker(goal):
             if result:
                 cmd = result.command
                 add_log(f"🤖 {result.reason} [{cmd.upper()}]")
-
-                if cmd in ("forward", "backward"):
-                    car(cmd)
-                    time.sleep(MOVE_PULSE_SECONDS)
-                    car("stop")
-                elif cmd in ("left", "right"):
-                    car(cmd)
-                    time.sleep(TURN_PULSE_SECONDS)
-                    car("stop")
-                else:
-                    car("stop")
+                execute_pulse(cmd)
 
                 if result.done:
                     add_log("✨ Ο στόχος ολοκληρώθηκε!")
@@ -376,12 +366,7 @@ def status():
 def manual_cmd():
     data = request.json
     cmd = data.get("command")
-    if cmd in ("forward", "backward"):
-        car(cmd)
-    elif cmd in ("left", "right"):
-        car(cmd)
-    else:
-        car("stop")
+    execute_pulse(cmd)
     return jsonify({"status": "ok"})
 
 @app.route("/control_var", methods=["POST"])
