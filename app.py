@@ -14,8 +14,9 @@ CAPTURE_URL = f"{CONTROL_BASE}/capture"
 MODEL = "gemini-robotics-er-2-preview"
 
 CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
-MOVE_PULSE_SECONDS = 0.25     
-TURN_PULSE_SECONDS = 0.15     
+
+# Αποθηκεύουμε την τρέχουσα ταχύτητα (αρχική τιμή 6, όπως στο slider)
+current_speed = 6
 
 _session = requests.Session()
 
@@ -39,15 +40,27 @@ def car(command: str) -> None:
     if command in CAR_VALS:
         control("car", CAR_VALS[command])
 
+def get_pulse_durations():
+    """Υπολογίζει δυναμικά τη διάρκεια του βήματος ανάλογα με την ταχύτητα (speed: 0 έως 12)"""
+    global current_speed
+    # Αν η ταχύτητα είναι 0, ο χρόνος γίνεται ελάχιστος. Μεγαλύτερη ταχύτητα = μεγαλύτερο βήμα.
+    # Βασικός συντελεστής: speed 6 δίνει περίπου 0.25s για κίνηση και 0.15s για στροφή.
+    speed_factor = max(1, current_speed) / 6.0
+    move_time = 0.25 * speed_factor
+    turn_time = 0.15 * speed_factor
+    return move_time, turn_time
+
 def execute_pulse(cmd: str):
-    """Εκτελεί μια μικρή, ελεγχόμενη κίνηση (pulse) και σταματάει αμέσως"""
+    """Εκτελεί μια μικρή κίνηση με διάρκεια προσαρμοσμένη στην τρέχουσα ταχύτητα"""
+    move_time, turn_time = get_pulse_durations()
+    
     if cmd in ("forward", "backward"):
         car(cmd)
-        time.sleep(MOVE_PULSE_SECONDS)
+        time.sleep(move_time)
         car("stop")
     elif cmd in ("left", "right"):
         car(cmd)
-        time.sleep(TURN_PULSE_SECONDS)
+        time.sleep(turn_time)
         car("stop")
     else:
         car("stop")
@@ -68,7 +81,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Pulse Mode</title>
+    <title>Rover Cloud Control - Dynamic Speed Pulse</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -258,9 +271,8 @@ HTML_TEMPLATE = """
             sendControlVar(paramName, val);
         }
 
-        // Υποστήριξη WASD και Βελάκων από το πληκτρολόγιο (κάθε πάτημα δίνει ένα καθαρό βήμα)
         window.addEventListener('keydown', (e) => {
-            if (e.repeat) return; // Αποφυγή spamming αν κρατηθεί πατημένο
+            if (e.repeat) return;
             let k = e.key.toLowerCase();
             if (k === 'w' || e.key === 'ArrowUp') sendCmd('forward');
             else if (k === 's' || e.key === 'ArrowDown') sendCmd('backward');
@@ -371,9 +383,18 @@ def manual_cmd():
 
 @app.route("/control_var", methods=["POST"])
 def control_var():
+    global current_speed
     data = request.json
     var_name = data.get("var")
     val = data.get("val")
+    
+    # Αν ο χρήστης αλλάξει την ταχύτητα, την αποθηκεύουμε τοπικά στην Python
+    if var_name == "speed":
+        try:
+            current_speed = int(val)
+        except ValueError:
+            pass
+
     control(var_name, val)
     add_log(f"⚙️ Ρύθμιση αποστάλθηκε: var={var_name}&val={val}")
     return jsonify({"status": "success", "var": var_name, "val": val})
