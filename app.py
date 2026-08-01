@@ -15,11 +15,12 @@ MODEL = "gemini-robotics-er-2-preview"
 
 CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 
-# Αποθηκεύουμε την τρέχουσα ταχύτητα (αρχική τιμή 6, όπως στο slider)
+# Αποθηκεύουμε την τρέχουσα ταχύτητα (αρχική τιμή 6)
 current_speed = 6
 
 _session = requests.Session()
 
+# Μεταβλητές κατάστασης για το AI Thread
 ai_thread = None
 ai_running = False
 ai_status_log = "Σύστημα έτοιμο..."
@@ -41,17 +42,21 @@ def car(command: str) -> None:
         control("car", CAR_VALS[command])
 
 def get_pulse_durations():
-    """Υπολογίζει δυναμικά τη διάρκεια του βήματος ανάλογα με την ταχύτητα (speed: 0 έως 12)"""
+    """Υπολογίζει δυναμικά τη διάρκεια του βήματος με εκθετική κλίμακα για τέλειες μικροκινήσεις στις χαμηλές ταχύτητες"""
     global current_speed
-    # Αν η ταχύτητα είναι 0, ο χρόνος γίνεται ελάχιστος. Μεγαλύτερη ταχύτητα = μεγαλύτερο βήμα.
-    # Βασικός συντελεστής: speed 6 δίνει περίπου 0.25s για κίνηση και 0.15s για στροφή.
-    speed_factor = max(1, current_speed) / 6.0
-    move_time = 0.25 * speed_factor
-    turn_time = 0.15 * speed_factor
+    spd = max(0, min(12, current_speed))
+    
+    if spd == 0:
+        factor = 0.15 
+    else:
+        factor = (spd / 6.0) ** 1.5
+        
+    move_time = 0.25 * factor
+    turn_time = 0.15 * factor
     return move_time, turn_time
 
 def execute_pulse(cmd: str):
-    """Εκτελεί μια μικρή κίνηση με διάρκεια προσαρμοσμένη στην τρέχουσα ταχύτητα"""
+    """Εκτελεί μια μικρή κίνηση με διάρκεια προσαρμοσμένη στην τρέχουσα ταχύτητα και σταματάει αυτόματα"""
     move_time, turn_time = get_pulse_durations()
     
     if cmd in ("forward", "backward"):
@@ -81,7 +86,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Dynamic Speed Pulse</title>
+    <title>Rover Cloud Control - Full Controls</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -388,7 +393,6 @@ def control_var():
     var_name = data.get("var")
     val = data.get("val")
     
-    # Αν ο χρήστης αλλάξει την ταχύτητα, την αποθηκεύουμε τοπικά στην Python
     if var_name == "speed":
         try:
             current_speed = int(val)
