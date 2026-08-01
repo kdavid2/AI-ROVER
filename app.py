@@ -9,21 +9,24 @@ from pydantic import BaseModel, Field
 
 app = Flask(__name__)
 
+# --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
+APP_VERSION = "v1.1"
+
 CONTROL_BASE = os.environ["ROVER_URL"]
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
 MODEL = "gemini-robotics-er-2-preview"
 
 CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 
-# Αποθηκεύουμε την τρέχουσα ταχύτητα (αρχική τιμή 6)
 current_speed = 6
-
 _session = requests.Session()
 
-# Μεταβλητές κατάστασης για το AI Thread
 ai_thread = None
 ai_running = False
 ai_status_log = "Σύστημα έτοιμο..."
+
+# Ιστορικό κινήσεων για την αποφυγή λούπας
+action_history = []
 
 class RoverDecision(BaseModel):
     command: str = Field(description="Η εντολή: forward, backward, left, right, stop")
@@ -42,21 +45,20 @@ def car(command: str) -> None:
         control("car", CAR_VALS[command])
 
 def get_pulse_durations():
-    """Υπολογίζει δυναμικά τη διάρκεια του βήματος με εκθετική κλίμακα για τέλειες μικροκινήσεις στις χαμηλές ταχύτητες"""
+    """Πιο επιθετική εκθετική κλίμακα για εξαιρετικά μικρές και γρήγορες μικροκινήσεις"""
     global current_speed
     spd = max(0, min(12, current_speed))
     
     if spd == 0:
-        factor = 0.15 
+        factor = 0.08 
     else:
-        factor = (spd / 6.0) ** 1.5
+        factor = (spd / 6.0) ** 2.0  # Αυξημένος εκθέτης για άμεση μείωση χρόνου στις χαμηλές τιμές
         
-    move_time = 0.25 * factor
-    turn_time = 0.15 * factor
+    move_time = 0.20 * factor
+    turn_time = 0.12 * factor
     return move_time, turn_time
 
 def execute_pulse(cmd: str):
-    """Εκτελεί μια μικρή κίνηση με διάρκεια προσαρμοσμένη στην τρέχουσα ταχύτητα και σταματάει αυτόματα"""
     move_time, turn_time = get_pulse_durations()
     
     if cmd in ("forward", "backward"):
@@ -90,6 +92,7 @@ HTML_TEMPLATE = """
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
+        .version-badge { background: #734CA7; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-left: 5px; }
         .cam-container { margin: 10px auto; max-width: 400px; }
         img { width: 100%; border-radius: 8px; border: 2px solid #444; }
         
@@ -129,7 +132,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>🤖 Rover Cloud Control</h2>
+    <h2>🤖 Rover Cloud Control <span class="version-badge" id="appVersion">...</span></h2>
 
     <ul class="tabs">
         <li onclick="switchTab('control')" id="tab-control-btn">Control</li>
@@ -219,6 +222,12 @@ HTML_TEMPLATE = """
             document.querySelector('.' + tabName + '-tab').classList.remove('hide');
         }
 
+        // Φόρτωση έκδοσης
+        fetch('/version').then(res => res.json()).then(data => {
+            let badge = document.getElementById('appVersion');
+            if(badge) badge.innerText = data.version;
+        });
+
         setInterval(() => {
             let img = document.getElementById('camStream');
             if(img) img.src = '/video_feed?' + new Date().getTime();
@@ -299,7 +308,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
-log_lines = ["Σύστημα έτοιμο..."]
+log_lines = [f"Σύστημα έτοιμο ({APP_VERSION})..."]
 
 def add_log(msg):
     global log_lines
@@ -307,6 +316,28 @@ def add_log(msg):
     log_lines.append(msg)
     if len(log_lines) > 40:
         log_lines.pop(0)
+
+def check_and_break_loop(cmd):
+    """Ελέγχει αν υπάρχει ατέρμονη λούπα (π.χ. αριστερά-δεξιά-αριστερά-δεξιά) και επεμβαίνει"""
+    global action_history
+    action_history.append(cmd)
+    if len(action_history) > 6:
+        action_history.pop(0)
+        
+    # Έλεγχος για μοτίβο τύπου left/right εναλλάξ (>= 4 επαναλήψεις)
+    if len(action_history) >= 4:
+        last_4 = action_history[-4:]
+        if last_4 == ['left', 'right', 'left', 'right'] or last_4 == ['right', 'left', 'right', 'left']:
+            add_log("🔄 Εντοπίστηκε λούπα αριστερά/δεξιά! Εκτελείται αυτόματη διαφυγή (πισωδρόμηση).")
+            action_history.clear()
+            return 'backward' # Εναλλακτική κίνηση διαφυγής
+            
+        if last_4 == ['forward', 'backward', 'forward', 'backward'] or last_4 == ['backward', 'forward', 'backward', 'forward']:
+            add_log("🔄 Εντοπίστηκε λούπα μπρος/πίσω! Εκτελείται αυτόματη διαφυγή (στροφή).")
+            action_history.clear()
+            return 'left' # Εναλλακτική κίνηση διαφυγής
+            
+    return cmd
 
 def ai_worker(goal):
     global ai_running
@@ -317,19 +348,25 @@ def ai_worker(goal):
         return
 
     client = genai.Client(api_key=api_key)
-    system_prompt = "Είσαι το ρομπότ rover. Πρόχώρα 'forward' αν είναι ελεύθερα, στρίψε αν υπάρχει εμπόδιο. Θυμήσου τις προηγούμενες κινήσεις σου για να αποφεύγεις επαναλαμβανόμενα λάθη. Αν τελείωσες, done=True."
+    system_prompt = (
+        "Είσαι το ρομπότ rover. Πρόχώρα 'forward' αν ο δρόμος είναι ελεύθερος. "
+        "Θυμήσου τις προηγούμενες κινήσεις σου και ΜΗΝ επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη "
+        "(όπως συνεχώς αριστερά-δεξιά χωρίς πρόοδο). Αν βρεις εμπόδιο ή πόρτα και κολλήσεις, "
+        "δοκίμασε μια αποφασιστική στροφή ή υποχώρηση αντί για ατέρμονες μικροκινήσεις. "
+        "Αν τελείωσες, βάλε done=True."
+    )
 
     try:
         chat = client.chats.create(
             model=MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                temperature=0.2,
+                temperature=0.3,
                 response_mime_type="application/json",
                 response_schema=RoverDecision,
             )
         )
-        add_log(f"🚀 Ξεκίνησε AI με στόχο: {goal}")
+        add_log(f"🚀 Ξεκίνησε AI Mode ({APP_VERSION}) με στόχο: {goal}")
         
         while ai_running:
             frame = get_frame()
@@ -338,9 +375,10 @@ def ai_worker(goal):
                 time.sleep(2)
                 continue
 
+            # Έξυπνη σάρωση πολλαπλών frames αν παρατηρηθεί καθυστέρηση/κόλλημα
             contents = [
                 types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                f"Στόχος: {goal}. Τρέχουσα εικόνα από την κάμερα."
+                f"Στόχος: {goal}. Αξιολόγησε την εικόνα και δες το ιστορικό για να αποφύγεις αδιέξοδα."
             ]
 
             response = chat.send_message(contents)
@@ -348,6 +386,10 @@ def ai_worker(goal):
 
             if result:
                 cmd = result.command
+                
+                # Έλεγχος και αποτροπή ατέρμονης λούπας
+                cmd = check_and_break_loop(cmd)
+                
                 add_log(f"🤖 {result.reason} [{cmd.upper()}]")
                 execute_pulse(cmd)
 
@@ -355,7 +397,7 @@ def ai_worker(goal):
                     add_log("✨ Ο στόχος ολοκληρώθηκε!")
                     break
             
-            time.sleep(1)
+            time.sleep(0.8)
 
     except Exception as e:
         add_log(f"⚠️ Σφάλμα AI: {str(e)}")
@@ -366,6 +408,10 @@ def ai_worker(goal):
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route("/version")
+def version():
+    return jsonify({"version": APP_VERSION})
 
 @app.route("/video_feed")
 def video_feed():
