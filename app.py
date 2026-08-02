@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v2.1-socket-torque-fix"
+APP_VERSION = "v2.2-range-calibration"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -21,7 +21,7 @@ CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 current_speed = 6
 parking_mode = False
 
-# Χρήση ενιαίου Session για αποφυγή εξάντλησης συνδέσεων στο ESP32
+# Χρήση ενιαίου Session για σταθερή σύνδεση (Keep-Alive)
 _session = requests.Session()
 
 ai_thread = None
@@ -37,7 +37,7 @@ class RoverDecision(BaseModel):
     reason: str = Field(description="Σύντομη αιτιολόγηση στα ελληνικά")
 
 def control(var: str, val) -> None:
-    """Σταθερή, συγχρονισμένη αποστολή εντολών μέσω HTTP Keep-Alive"""
+    """Σταθερή αποστολή εντολών μέσω HTTP Keep-Alive"""
     url = f"{CONTROL_BASE}/control?var={var}&val={val}"
     try:
         _session.get(url, timeout=1.5)
@@ -49,17 +49,18 @@ def car(command: str) -> None:
         control("car", CAR_VALS[command])
 
 def execute_pulse(cmd: str):
-    """Εκτέλεση ακριβούς Pulse με σωστή ροπή και διαχείριση συνδέσεων"""
+    """Διαχωρισμός διαρκειών για τεράστια οπτική διαφορά μεταξύ Normal & Parking Mode"""
     global parking_mode, current_speed
     
     if parking_mode:
-        # Χρόνοι ικανοί να υπερνικήσουν τη στατική τριβή χωρίς να "πετάγεται" το rover
-        move_time = 0.08  # 80 milliseconds
-        turn_time = 0.06  # 60 milliseconds
+        # Micro-Pulse για παρκάρισμα ακριβείας (1-2 cm)
+        move_time = 0.03  # 30 milliseconds
+        turn_time = 0.02  # 20 milliseconds
     else:
+        # Κανονική πορεία πλοήγησης (10-15 cm)
         spd = max(0, min(12, current_speed))
-        move_time = 0.08 + (spd / 12.0) * 0.16
-        turn_time = 0.05 + (spd / 12.0) * 0.10
+        move_time = 0.20 + (spd / 12.0) * 0.30  # Εύρος: 0.20s έως 0.50s
+        turn_time = 0.12 + (spd / 12.0) * 0.20  # Εύρος: 0.12s έως 0.32s
 
     if cmd in ("forward", "backward"):
         car(cmd)
@@ -101,7 +102,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Socket & Torque Fix</title>
+    <title>Rover Cloud Control - Range Calibrated</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -567,12 +568,11 @@ def parking_toggle():
     parking_mode = data.get("active", False)
     
     if parking_mode:
-        # Ρυθμίζει την ταχύτητα στο 3 (ιδανική ροπή χωρίς απότομη επιτάχυνση)
-        control("speed", 3)
-        add_log("🎯 Parking Mode: ON (Speed=3, Pulses=80ms)")
+        control("speed", 4)
+        add_log("🎯 Parking Mode: ON (Speed=4, Micro-Pulse=30ms)")
     else:
         control("speed", current_speed)
-        add_log(f"🎯 Parking Mode: OFF (Επαναφορά Speed={current_speed})")
+        add_log(f"🎯 Parking Mode: OFF (Speed={current_speed})")
         
     return jsonify({"parking_mode": parking_mode})
 
