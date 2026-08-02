@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.3-safety-fixed"
+APP_VERSION = "v1.4-full-tools"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -27,10 +27,9 @@ ai_status_log = "Σύστημα έτοιμο..."
 
 # Ιστορικό κινήσεων για την αποφυγή λούπας
 action_history = []
-last_reason_spoken = ""
 
 class RoverDecision(BaseModel):
-    command: str = Field(description="Η εντολή: forward, backward, left, right, stop")
+    command: str = Field(description="Η εντολή: forward, backward, left, right, stop, tiltup, tiltdown")
     done: bool = Field(description="True αν ο στόχος ολοκληρώθηκε")
     reason: str = Field(description="Σύντομη αιτιολόγηση στα ελληνικά")
 
@@ -73,6 +72,19 @@ def execute_pulse(cmd: str):
     else:
         car("stop")
 
+def execute_rover_action(cmd: str):
+    """Εκτελεί όλες τις διαθέσιμες ενέργειες (κίνηση + tilt κάμερας)"""
+    if cmd in ("forward", "backward", "left", "right", "stop"):
+        execute_pulse(cmd)
+    elif cmd == "tiltup":
+        control("ltrim", 1)
+        add_log("📷 Κλίση Κάμερας: ΠΑΝΩ (tiltup)")
+        time.sleep(0.3)
+    elif cmd == "tiltdown":
+        control("rtrim", 1)
+        add_log("📷 Κλίση Κάμερας: ΚΑΤΩ (tiltdown)")
+        time.sleep(0.3)
+
 def get_frame() -> bytes:
     try:
         r = _session.get(CAPTURE_URL, timeout=4)
@@ -89,7 +101,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Live Voice Enabled</title>
+    <title>Rover Cloud Control - Full Tools Mode</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -223,7 +235,6 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        let lastSpokenLog = "";
         let isLiveMicActive = false;
         let recognition = null;
 
@@ -256,11 +267,6 @@ HTML_TEMPLATE = """
                     msgBox.innerHTML = data.logs.replace(/\\n/g, "<br>");
                     msgBox.scrollTop = msgBox.scrollHeight;
                 }
-                
-                if(data.last_reason && data.last_reason !== lastSpokenLog) {
-                    lastSpokenLog = data.last_reason;
-                    speakText(data.last_reason);
-                }
 
                 let btn = document.getElementById('aiBtn');
                 if(btn) {
@@ -275,16 +281,7 @@ HTML_TEMPLATE = """
             });
         }, 1000);
 
-        function speakText(text) {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-                let utterance = new SpeechSynthesisUtterance(text);
-                utterance.lang = 'el-GR';
-                utterance.rate = 1.0;
-                window.speechSynthesis.speak(utterance);
-            }
-        }
-
+        // --- LIVE MIC ENGINE (Continuous Speech Recognition) ---
         function toggleLiveVoice() {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) {
@@ -417,7 +414,7 @@ def check_and_break_loop(cmd):
     return cmd
 
 def ai_worker(goal):
-    global ai_running, last_reason_spoken
+    global ai_running
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         add_log("❌ Σφάλμα: Δεν βρέθηκε GEMINI_API_KEY")
@@ -426,15 +423,21 @@ def ai_worker(goal):
 
     client = genai.Client(api_key=api_key)
     
-    # --- ΕΝΙΣΧΥΜΕΝΟ SYSTEM PROMPT ΓΙΑ ΑΥΣΤΗΡΗ ΑΠΟΦΥΓΗ ΕΜΠΟΔΙΩΝ ---
+    # --- ΕΝΙΣΧΥΜΕΝΟ SYSTEM PROMPT ΜΕ ΠΛΗΡΗ ΧΡΗΣΗ ΕΡΓΑΛΕΙΩΝ CAM TILT ---
     system_prompt = (
-        "Είσαι το ρομπότ rover. Η ΠΡΩΤΗ ΣΟΥ ΠΡΟΤΕΡΑΙΟΤΗΤΑ ΕΙΝΑΙ Η ΑΣΦΑΛΕΙΑ.\n"
-        "1. ΕΞΕΤΑΣΕ ΠΡΟΣΕΚΤΙΚΑ ΤΗΝ ΕΙΚΟΝΑ. Αν βλέπεις εμπόδιο, τοίχο, έπιπλο ή σκοτάδι από κοντά, "
-        "ΑΠΑΓΟΡΕΥΕΤΑΙ ΑΥΣΤΗΡΑ να δώσεις 'forward'.\n"
-        "2. Αν ο δρόμος είναι μπλοκαρισμένος, διάλεξε 'left', 'right' ή 'backward' για να ελευθερωθεί το πεδίο.\n"
-        "3. Δώσε 'forward' ΜΟΝΟ αν βλέπεις καθαρά ανοιχτό, ελεύθερο διάδρομο/χώρο.\n"
-        "4. Μην επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη.\n"
-        "5. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο πεδίο reason. Αν τελείωσες τον στόχο, βάλε done=True."
+        "Είσαι το αυτόνομο ρομπότ rover. Η ΠΡΩΤΗ ΣΟΥ ΠΡΟΤΕΡΑΙΟΤΗΤΑ ΕΙΝΑΙ Η ΑΣΦΑΛΕΙΑ ΚΑΙ Η ΣΩΣΤΗ ΕΠΙΣΚΟΠΗΣΗ.\n\n"
+        "ΔΙΑΘΕΣΙΜΕΣ ΕΝΤΟΛΕΣ (command):\n"
+        "- 'forward': Προχώρα μπροστά (ΜΟΝΟ αν βλέπεις καθαρά ελεύθερο πάτωμα/διάδρομο).\n"
+        "- 'backward': Πίσω (αν είσαι πολύ κοντά σε εμπόδιο ή κόλλησες).\n"
+        "- 'left' / 'right': Στροφή.\n"
+        "- 'stop': Σταμάτημα.\n"
+        "- 'tiltdown': Γείρε την κάμερα ΚΑΤΩ για να ελέγξεις το πάτωμα και χαμηλά εμπόδια.\n"
+        "- 'tiltup': Γείρε την κάμερα ΠΑΝΩ για να δεις τον υπόλοιπο χώρο.\n\n"
+        "ΚΑΝΟΝΕΣ ΠΛΟΗΓΗΣΗΣ:\n"
+        "1. Αν δεν βλέπεις καθαρά το πάτωμα μπροστά σου (ή αν αμφιβάλεις), χρησιμοποίησε 'tiltdown' για να ελέγξεις πριν δώσεις 'forward'.\n"
+        "2. ΑΠΑΓΟΡΕΥΕΤΑΙ ΑΥΣΤΗΡΑ το 'forward' αν βλέπεις εμπόδιο, τοίχο, έπιπλο, ή αν η εικόνα είναι μπλοκαρισμένη/σκοτεινή.\n"
+        "3. Αν ο δρόμος είναι μπλοκαρισμένος, χρησιμοποίησε 'tiltdown' / 'tiltup' για να αξιολογήσεις ή 'left'/'right'/'backward' για να ελευθερωθείς.\n"
+        "4. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο 'reason'. Αν ο στόχος ολοκληρώθηκε, βάλε done=True."
     )
 
     try:
@@ -442,7 +445,7 @@ def ai_worker(goal):
             model=MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                temperature=0.2, # Χαμηλότερη θερμοκρασία για πιο προσεκτικές αποφάσεις
+                temperature=0.2,
                 response_mime_type="application/json",
                 response_schema=RoverDecision,
             )
@@ -458,7 +461,7 @@ def ai_worker(goal):
 
             contents = [
                 types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                f"Στόχος: {goal}. Έλεγξε πρώτα αν υπάρχει εμπόδιο μπροστά σου!"
+                f"Στόχος: {goal}. Αξιολόγησε την εικόνα, έλεγξε το πάτωμα με tiltdown αν χρειάζεται και αποφάσισε."
             ]
 
             response = chat.send_message(contents)
@@ -468,9 +471,8 @@ def ai_worker(goal):
                 cmd = result.command
                 cmd = check_and_break_loop(cmd)
                 
-                last_reason_spoken = result.reason
                 add_log(f"🤖 {result.reason} [{cmd.upper()}]")
-                execute_pulse(cmd)
+                execute_rover_action(cmd)
 
                 if result.done:
                     add_log("✨ Ο στόχος ολοκληρώθηκε!")
@@ -501,18 +503,17 @@ def video_feed():
 
 @app.route("/status")
 def status():
-    global ai_running, log_lines, last_reason_spoken
+    global ai_running, log_lines
     return jsonify({
         "running": ai_running, 
-        "logs": "<br>".join(log_lines),
-        "last_reason": last_reason_spoken
+        "logs": "<br>".join(log_lines)
     })
 
 @app.route("/cmd", methods=["POST"])
 def manual_cmd():
     data = request.json
     cmd = data.get("command")
-    execute_pulse(cmd)
+    execute_rover_action(cmd)
     return jsonify({"status": "ok"})
 
 @app.route("/control_var", methods=["POST"])
