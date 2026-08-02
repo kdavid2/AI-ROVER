@@ -2,7 +2,8 @@ import os
 import time
 import threading
 import requests
-from flask import Flask, render_template_string, request, jsonify
+from functools import wraps
+from flask import Flask, render_template_string, request, jsonify, Response
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -10,7 +11,11 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v2.4-speed-test-0.01"
+APP_VERSION = "v2.6-timeout-20m-no-stop"
+
+# --- ΔΙΑΠΙΣΤΕΥΤΗΡΙΑ ΑΣΦΑΛΕΙΑΣ (ENVIRONMENT VARIABLES) ---
+WEB_USER = os.environ.get("WEB_USER", "admin")
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "rover123")
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -21,7 +26,6 @@ CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 current_speed = 6
 parking_mode = False
 
-# Χρήση ενιαίου Session για σταθερή σύνδεση (Keep-Alive)
 _session = requests.Session()
 
 ai_thread = None
@@ -31,13 +35,31 @@ ai_status_log = "Σύστημα έτοιμο..."
 # Ιστορικό κινήσεων για την αποφυγή λούπας
 action_history = []
 
+# --- ΜΗΧΑΝΙΣΜΟΣ HTTP BASIC AUTHENTICATION ---
+def check_auth(username, password):
+    return username == WEB_USER and password == WEB_PASSWORD
+
+def authenticate():
+    return Response(
+        'Απαιτείται σύνδεση για την πρόσβαση στο Rover Control.', 401,
+        {'WWW-Authenticate': 'Basic realm="Login Required"'}
+    )
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
 class RoverDecision(BaseModel):
     command: str = Field(description="Η εντολή: forward, backward, left, right, stop, tiltup, tiltdown")
     done: bool = Field(description="True αν ο στόχος ολοκληρώθηκε")
     reason: str = Field(description="Σύντομη αιτιολόγηση στα ελληνικά")
 
 def control(var: str, val) -> None:
-    """Σταθερή αποστολή εντολών μέσω HTTP Keep-Alive"""
     url = f"{CONTROL_BASE}/control?var={var}&val={val}"
     try:
         _session.get(url, timeout=1.5)
@@ -49,18 +71,15 @@ def car(command: str) -> None:
         control("car", CAR_VALS[command])
 
 def execute_pulse(cmd: str):
-    """Διαχωρισμός διαρκειών για τεράστια οπτική διαφορά μεταξύ Normal & Parking Mode"""
     global parking_mode, current_speed
     
     if parking_mode:
-        # Micro-Pulse για παρκάρισμα ακριβείας (1-2 cm)
-        move_time = 0.03  # 30 milliseconds
-        turn_time = 0.02  # 20 milliseconds
+        move_time = 0.03
+        turn_time = 0.02
     else:
-        # Κανονική πορεία πλοήγησης (10-15 cm)
         spd = max(0, min(12, current_speed))
-        move_time = 0.20 + (spd / 12.0) * 0.30  # Εύρος: 0.20s έως 0.50s
-        turn_time = 0.12 + (spd / 12.0) * 0.20  # Εύρος: 0.12s έως 0.32s
+        move_time = 0.20 + (spd / 12.0) * 0.30
+        turn_time = 0.12 + (spd / 12.0) * 0.20
 
     if cmd in ("forward", "backward"):
         car(cmd)
@@ -74,7 +93,6 @@ def execute_pulse(cmd: str):
         car("stop")
 
 def execute_rover_action(cmd: str):
-    """Εκτελεί όλες τις διαθέσιμες ενέργειες (κίνηση + tilt κάμερας)"""
     if cmd in ("forward", "backward", "left", "right", "stop"):
         execute_pulse(cmd)
     elif cmd == "tiltup":
@@ -88,7 +106,7 @@ def execute_rover_action(cmd: str):
 
 def get_frame() -> bytes:
     try:
-        r = _session.get(CAPTURE_URL, timeout=3)
+        r = _session.get(CAPTURE_URL, timeout=2)
         r.raise_for_status()
         if r.content.startswith(b"\xff\xd8"):
             return r.content
@@ -102,7 +120,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Speed Test 0.01</title>
+    <title>Rover Cloud Control</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -410,7 +428,6 @@ def add_log(msg):
         log_lines.pop(0)
 
 def check_and_break_loop(cmd):
-    """Ελέγχει αν υπάρχει ατέρμονη λούπα και επεμβαίνει"""
     global action_history
     action_history.append(cmd)
     if len(action_history) > 6:
@@ -456,6 +473,7 @@ def ai_worker(goal):
     )
 
     frame_buffer = []
+    loss_start_time = None
 
     try:
         chat = client.chats.create(
@@ -472,9 +490,23 @@ def ai_worker(goal):
         while ai_running:
             frame = get_frame()
             if not frame:
-                add_log("⚠️ Αποτυχία λήψης κάμερας, αναμονή...")
+                if loss_start_time is None:
+                    loss_start_time = time.time()
+                
+                elapsed_loss = time.time() - loss_start_time
+                add_log(f"⚠️ Απουσία εικόνας κάμερας ({int(elapsed_loss)}s / 1200s)...")
+                
+                # --- TIMEOUT 20 ΛΕΠΤΩΝ (1200 sec) XΩΡΙΣ ΑΠΟΣΤΟΛΗ STOP ---
+                if elapsed_loss >= 1200:
+                    add_log("🛑 TIMEOUT (20 λεπτά): Απενεργοποίηση AI Mode λόγω απουσίας σύνδεσης.")
+                    ai_running = False
+                    break
+                    
                 time.sleep(2)
                 continue
+
+            # Επαναφορά μετρητή χρόνου όταν λάβουμε έγκυρο frame
+            loss_start_time = None
 
             frame_buffer.append(frame)
             if len(frame_buffer) > 3:
@@ -513,15 +545,19 @@ def ai_worker(goal):
     ai_running = False
     add_log("AI Mode σταμάτησε.")
 
+# --- ΠΡΟΣΤΑΤΕΥΜΕΝΑ ROUTES ΜΕ LOGIN ---
 @app.route("/")
+@requires_auth
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route("/version")
+@requires_auth
 def version():
     return jsonify({"version": APP_VERSION})
 
 @app.route("/video_feed")
+@requires_auth
 def video_feed():
     frame = get_frame()
     if frame:
@@ -529,6 +565,7 @@ def video_feed():
     return "", 204
 
 @app.route("/status")
+@requires_auth
 def status():
     global ai_running, log_lines, parking_mode
     return jsonify({
@@ -538,6 +575,7 @@ def status():
     })
 
 @app.route("/cmd", methods=["POST"])
+@requires_auth
 def manual_cmd():
     data = request.json
     cmd = data.get("command")
@@ -545,6 +583,7 @@ def manual_cmd():
     return jsonify({"status": "ok"})
 
 @app.route("/control_var", methods=["POST"])
+@requires_auth
 def control_var():
     global current_speed
     data = request.json
@@ -562,6 +601,7 @@ def control_var():
     return jsonify({"status": "success", "var": var_name, "val": val})
 
 @app.route("/parking_toggle", methods=["POST"])
+@requires_auth
 def parking_toggle():
     global parking_mode, current_speed
     data = request.json
@@ -577,6 +617,7 @@ def parking_toggle():
     return jsonify({"parking_mode": parking_mode})
 
 @app.route("/ai_toggle", methods=["POST"])
+@requires_auth
 def ai_toggle():
     global ai_running, ai_thread
     if ai_running:
