@@ -10,9 +10,9 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.2-live-voice"
 
-CONTROL_BASE = os.environ["ROVER_URL"]
+CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
 MODEL = "gemini-robotics-er-2-preview"
 
@@ -27,6 +27,7 @@ ai_status_log = "Σύστημα έτοιμο..."
 
 # Ιστορικό κινήσεων για την αποφυγή λούπας
 action_history = []
+last_reason_spoken = ""
 
 class RoverDecision(BaseModel):
     command: str = Field(description="Η εντολή: forward, backward, left, right, stop")
@@ -52,7 +53,7 @@ def get_pulse_durations():
     if spd == 0:
         factor = 0.08 
     else:
-        factor = (spd / 6.0) ** 2.0  # Αυξημένος εκθέτης για άμεση μείωση χρόνου στις χαμηλές τιμές
+        factor = (spd / 6.0) ** 2.0
         
     move_time = 0.20 * factor
     turn_time = 0.12 * factor
@@ -88,7 +89,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Full Controls</title>
+    <title>Rover Cloud Control - Live Voice Enabled</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -127,7 +128,9 @@ HTML_TEMPLATE = """
         .setting-row button { width: 100%; padding: 10px; background: #734CA7; }
 
         .ai-section { margin: 15px auto; max-width: 400px; text-align: left; background: #1e1e1e; padding: 10px; border-radius: 8px; }
-        input[type="text"] { width: calc(100% - 16px); padding: 8px; margin-top: 5px; border-radius: 4px; border: none; }
+        .input-group { display: flex; gap: 5px; margin-top: 5px; }
+        input[type="text"] { flex: 1; padding: 8px; border-radius: 4px; border: none; }
+        .mic-btn { padding: 8px 12px; background: #e65100; font-size: 0.9rem; font-weight: bold; border-radius: 4px; border: none; color: white; cursor: pointer; }
         .log-box { background: #000; color: #0ff; font-family: monospace; font-size: 0.8rem; height: 110px; overflow-y: auto; padding: 8px; border-radius: 4px; margin-top: 10px; text-align: left; }
     </style>
 </head>
@@ -157,8 +160,11 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="ai-section">
-            <label><b>AI Στόχος (Gemini):</b></label>
-            <input type="text" id="aiGoal" value="κάνε περιπολία">
+            <label><b>AI Στόχος (Gemini Live Voice/Text):</b></label>
+            <div class="input-group">
+                <input type="text" id="aiGoal" value="κάνε περιπολία">
+                <button class="mic-btn" id="micBtn" onclick="toggleLiveVoice()">🎤 Live: OFF</button>
+            </div>
             <button onclick="toggleAi()" id="aiBtn" style="margin-top:8px; width:100%; padding: 10px; border:none; border-radius:6px; color:#fff; background:#2e7d32; cursor:pointer; font-weight:bold;">Εκκίνηση AI Mode</button>
             <div class="log-box" id="logBox">Σύστημα έτοιμο...</div>
         </div>
@@ -217,12 +223,15 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        let lastSpokenLog = "";
+        let isLiveMicActive = false;
+        let recognition = null;
+
         function switchTab(tabName) {
             document.querySelectorAll('.tab').forEach(t => t.classList.add('hide'));
             document.querySelector('.' + tabName + '-tab').classList.remove('hide');
         }
 
-        // Φόρτωση έκδοσης
         fetch('/version').then(res => res.json()).then(data => {
             let badge = document.getElementById('appVersion');
             if(badge) badge.innerText = data.version;
@@ -248,6 +257,12 @@ HTML_TEMPLATE = """
                     msgBox.scrollTop = msgBox.scrollHeight;
                 }
                 
+                // Φωνητική εκπομπή των νέων αποφάσεων του Gemini
+                if(data.last_reason && data.last_reason !== lastSpokenLog) {
+                    lastSpokenLog = data.last_reason;
+                    speakText(data.last_reason);
+                }
+
                 let btn = document.getElementById('aiBtn');
                 if(btn) {
                     if (data.running) {
@@ -260,6 +275,72 @@ HTML_TEMPLATE = """
                 }
             });
         }, 1000);
+
+        // --- LIPS & VOICE (Text To Speech) ---
+        function speakText(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+                let utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'el-GR';
+                utterance.rate = 1.0;
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+
+        // --- LIVE MIC ENGINE (Continuous Speech Recognition) ---
+        function toggleLiveVoice() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                alert("Ο browser σου δεν υποστηρίζει φωνητική αναγνώριση. Χρησιμοποίησε Chrome στο κινητό.");
+                return;
+            }
+
+            const micBtn = document.getElementById('micBtn');
+
+            if (isLiveMicActive) {
+                isLiveMicActive = false;
+                if (recognition) recognition.stop();
+                micBtn.style.background = "#e65100";
+                micBtn.innerText = "🎤 Live: OFF";
+                return;
+            }
+
+            isLiveMicActive = true;
+            micBtn.style.background = "#b71c1c";
+            micBtn.innerText = "🔴 Live: ON";
+
+            recognition = new SpeechRecognition();
+            recognition.lang = 'el-GR';
+            recognition.continuous = true;
+            recognition.interimResults = false;
+
+            recognition.onresult = function(event) {
+                const lastIndex = event.results.length - 1;
+                const transcript = event.results[lastIndex][0].transcript.trim();
+                
+                if (transcript.length > 0) {
+                    document.getElementById('aiGoal').value = transcript;
+                    
+                    fetch('/ai_toggle', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({goal: transcript})
+                    });
+                }
+            };
+
+            recognition.onend = function() {
+                if (isLiveMicActive) {
+                    try { recognition.start(); } catch(e) {}
+                }
+            };
+
+            recognition.onerror = function(event) {
+                console.log("Mic error: ", event.error);
+            };
+
+            recognition.start();
+        }
 
         function sendCmd(cmd) {
             fetch('/cmd', {
@@ -318,29 +399,28 @@ def add_log(msg):
         log_lines.pop(0)
 
 def check_and_break_loop(cmd):
-    """Ελέγχει αν υπάρχει ατέρμονη λούπα (π.χ. αριστερά-δεξιά-αριστερά-δεξιά) και επεμβαίνει"""
+    """Ελέγχει αν υπάρχει ατέρμονη λούπα και επεμβαίνει"""
     global action_history
     action_history.append(cmd)
     if len(action_history) > 6:
         action_history.pop(0)
         
-    # Έλεγχος για μοτίβο τύπου left/right εναλλάξ (>= 4 επαναλήψεις)
     if len(action_history) >= 4:
         last_4 = action_history[-4:]
         if last_4 == ['left', 'right', 'left', 'right'] or last_4 == ['right', 'left', 'right', 'left']:
-            add_log("🔄 Εντοπίστηκε λούπα αριστερά/δεξιά! Εκτελείται αυτόματη διαφυγή (πισωδρόμηση).")
+            add_log("🔄 Εντοπίστηκε λούπα αριστερά/δεξιά! Εκτελείται αυτόματη διαφυγή.")
             action_history.clear()
-            return 'backward' # Εναλλακτική κίνηση διαφυγής
+            return 'backward'
             
         if last_4 == ['forward', 'backward', 'forward', 'backward'] or last_4 == ['backward', 'forward', 'backward', 'forward']:
-            add_log("🔄 Εντοπίστηκε λούπα μπρος/πίσω! Εκτελείται αυτόματη διαφυγή (στροφή).")
+            add_log("🔄 Εντοπίστηκε λούπα μπρος/πίσω! Εκτελείται αυτόματη διαφυγή.")
             action_history.clear()
-            return 'left' # Εναλλακτική κίνηση διαφυγής
+            return 'left'
             
     return cmd
 
 def ai_worker(goal):
-    global ai_running
+    global ai_running, last_reason_spoken
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         add_log("❌ Σφάλμα: Δεν βρέθηκε GEMINI_API_KEY")
@@ -350,9 +430,8 @@ def ai_worker(goal):
     client = genai.Client(api_key=api_key)
     system_prompt = (
         "Είσαι το ρομπότ rover. Πρόχώρα 'forward' αν ο δρόμος είναι ελεύθερος. "
-        "Θυμήσου τις προηγούμενες κινήσεις σου και ΜΗΝ επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη "
-        "(όπως συνεχώς αριστερά-δεξιά χωρίς πρόοδο). Αν βρεις εμπόδιο ή πόρτα και κολλήσεις, "
-        "δοκίμασε μια αποφασιστική στροφή ή υποχώρηση αντί για ατέρμονες μικροκινήσεις. "
+        "Θυμήσου τις προηγούμενες κινήσεις σου και ΜΗΝ επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη. "
+        "Δώσε μια πολύ σύντομη αιτιολογία στα ελληνικά στο πεδίο reason. "
         "Αν τελείωσες, βάλε done=True."
     )
 
@@ -375,10 +454,9 @@ def ai_worker(goal):
                 time.sleep(2)
                 continue
 
-            # Έξυπνη σάρωση πολλαπλών frames αν παρατηρηθεί καθυστέρηση/κόλλημα
             contents = [
                 types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                f"Στόχος: {goal}. Αξιολόγησε την εικόνα και δες το ιστορικό για να αποφύγεις αδιέξοδα."
+                f"Στόχος: {goal}. Αξιολόγησε την εικόνα."
             ]
 
             response = chat.send_message(contents)
@@ -386,10 +464,9 @@ def ai_worker(goal):
 
             if result:
                 cmd = result.command
-                
-                # Έλεγχος και αποτροπή ατέρμονης λούπας
                 cmd = check_and_break_loop(cmd)
                 
+                last_reason_spoken = result.reason
                 add_log(f"🤖 {result.reason} [{cmd.upper()}]")
                 execute_pulse(cmd)
 
@@ -422,8 +499,12 @@ def video_feed():
 
 @app.route("/status")
 def status():
-    global ai_running, log_lines
-    return jsonify({"running": ai_running, "logs": "<br>".join(log_lines)})
+    global ai_running, log_lines, last_reason_spoken
+    return jsonify({
+        "running": ai_running, 
+        "logs": "<br>".join(log_lines),
+        "last_reason": last_reason_spoken
+    })
 
 @app.route("/cmd", methods=["POST"])
 def manual_cmd():
