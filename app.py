@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.7-motion-understanding"
+APP_VERSION = "v1.8-parking-precision"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -19,6 +19,7 @@ MODEL = "gemini-robotics-er-2-preview"
 CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 
 current_speed = 6
+parking_mode = False  # Νέα λειτουργία ακριβείας για παρκάρισμα
 _session = requests.Session()
 
 ai_thread = None
@@ -45,21 +46,26 @@ def car(command: str) -> None:
         control("car", CAR_VALS[command])
 
 def get_pulse_durations():
-    """Πιο επιθετική εκθετική κλίμακα για εξαιρετικά μικρές και γρήγορες μικροκινήσεις"""
-    global current_speed
-    spd = max(0, min(12, current_speed))
+    """Υπολογισμός χρόνων κίνησης με υποστήριξη Ultra-Precision Parking Mode"""
+    global current_speed, parking_mode
     
-    if spd == 0:
-        factor = 0.08 
-    else:
-        factor = (spd / 6.0) ** 2.0
+    if parking_mode:
+        # Εξαιρετικά μικρές κινήσεις (20-30ms) για παρκάρισμα ακριβείας
+        return 0.03, 0.02
         
-    move_time = 0.20 * factor
-    turn_time = 0.12 * factor
+    spd = max(0, min(12, current_speed))
+    # Γραμμική κλίμακα από 30ms (speed 0) έως 230ms (speed 12)
+    move_time = 0.03 + (spd / 12.0) * 0.20
+    turn_time = 0.02 + (spd / 12.0) * 0.12
     return move_time, turn_time
 
 def execute_pulse(cmd: str):
+    global parking_mode
     move_time, turn_time = get_pulse_durations()
+    
+    # Αν είμαστε σε Parking Mode, χαμηλώνουμε αυτόματα την τάση των μοτέρ στο ESP32
+    if parking_mode:
+        control("speed", 1)
     
     if cmd in ("forward", "backward"):
         car(cmd)
@@ -101,7 +107,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Motion Understanding</title>
+    <title>Rover Cloud Control - Precision Parking</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -118,7 +124,7 @@ HTML_TEMPLATE = """
         .controls { 
             display: grid; 
             grid-template-columns: repeat(3, 90px); 
-            grid-template-rows: repeat(3, 65px);
+            grid-template-rows: repeat(4, 60px);
             gap: 8px; 
             justify-content: center; 
             margin: 15px 0; 
@@ -133,6 +139,8 @@ HTML_TEMPLATE = """
         .btn-down { grid-column: 2; grid-row: 3; }
         .btn-tiltup { grid-column: 1; grid-row: 3; background-color: #2e7d32; font-size: 0.9rem; }
         .btn-tiltdown { grid-column: 3; grid-row: 3; background-color: #2e7d32; font-size: 0.9rem; }
+        
+        .btn-parking { grid-column: 1 / span 3; grid-row: 4; background-color: #0288d1; font-weight: bold; font-size: 1rem; }
 
         .setting-row { margin: 15px auto; max-width: 400px; text-align: left; background: #1e1e1e; padding: 10px; border-radius: 8px; }
         .setting-row label { display: block; margin-bottom: 5px; font-size: 0.9rem; color: #ccc; }
@@ -169,6 +177,7 @@ HTML_TEMPLATE = """
             <button class="btn-down" onclick="sendCmd('backward')">Backward</button>
             <button class="btn-tiltup" onclick="sendControlVar('ltrim', 1)">Tilt Up</button>
             <button class="btn-tiltdown" onclick="sendControlVar('rtrim', 1)">Tilt Down</button>
+            <button class="btn-parking" id="parkingBtn" onclick="toggleParking()">🎯 Parking Mode: OFF</button>
         </div>
 
         <div class="ai-section">
@@ -236,6 +245,7 @@ HTML_TEMPLATE = """
 
     <script>
         let isLiveMicActive = false;
+        let isParkingActive = false;
         let recognition = null;
 
         function switchTab(tabName) {
@@ -281,7 +291,19 @@ HTML_TEMPLATE = """
             });
         }, 1000);
 
-        // --- LIVE MIC ENGINE ---
+        function toggleParking() {
+            isParkingActive = !isParkingActive;
+            let btn = document.getElementById('parkingBtn');
+            btn.innerText = "🎯 Parking Mode: " + (isParkingActive ? "ON" : "OFF");
+            btn.style.background = isParkingActive ? "#e65100" : "#0288d1";
+
+            fetch('/parking_toggle', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({active: isParkingActive})
+            });
+        }
+
         function toggleLiveVoice() {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) {
@@ -414,7 +436,7 @@ def check_and_break_loop(cmd):
     return cmd
 
 def ai_worker(goal):
-    global ai_running
+    global ai_running, parking_mode
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         add_log("❌ Σφάλμα: Δεν βρέθηκε GEMINI_API_KEY")
@@ -423,10 +445,8 @@ def ai_worker(goal):
 
     client = genai.Client(api_key=api_key)
     
-    # --- ΒΕΛΤΙΩΜΕΝΟ SYSTEM PROMPT ΓΙΑ ΦΥΣΙΟΛΟΓΙΚΗ ΚΙΝΗΣΗ ΕΥΘΕΙΑΣ ---
     system_prompt = (
-        "Είσαι το αυτόνομο ρομπότ rover. Λαμβάνεις έως 3 διαδοχικά frames από την κάμερα "
-        "(με χρονική σειρά: από την παλαιότερη εικόνα στην πιο πρόσφατη).\n\n"
+        "Είσαι το αυτόνομο ρομπότ rover. Λαμβάνεις έως 3 διαδοχικά frames από την κάμερα.\n\n"
         "ΔΙΑΘΕΣΙΜΕΣ ΕΝΤΟΛΕΣ (command):\n"
         "- 'forward': Προχώρα μπροστά (αν βλέπεις ανοιχτό, ελεύθερο διάδρομο/χώρο).\n"
         "- 'backward': Πίσω (αν είσαι κολλημένος, προσκρουσμένος σε εμπόδιο ή πολύ κοντά σε τοίχο).\n"
@@ -434,13 +454,10 @@ def ai_worker(goal):
         "- 'stop': Σταμάτημα.\n"
         "- 'tiltdown': Γείρε την κάμερα ΚΑΤΩ για να ελέγξεις το πάτωμα και χαμηλά εμπόδια.\n"
         "- 'tiltup': Γείρε την κάμερα ΠΑΝΩ για να δεις τον υπόλοιπο χώρο.\n\n"
-        "ΚΑΝΟΝΕΣ ΚΙΝΗΣΗΣ & ΔΙΑΚΡΙΣΗ ΚΟΛΛΗΜΑΤΟΣ:\n"
-        "1. ΦΥΣΙΟΛΟΓΙΚΗ ΚΙΝΗΣΗ ΕΥΘΕΙΑ (FORWARD): Όταν προχωράς ευθεία, είναι ΑΠΟΛΥΤΩΣ ΛΟΓΙΚΟ η εικόνα να διατηρεί το ίδιο κεντρικό πλάνο "
-        "(όπως όταν οδηγείς αυτοκίνητο σε ευθεία). Τα αντικείμενα απλά μεγαλώνουν ελαφρώς ή πλησιάζουν. Αυτό ΔΕΝ σημαίνει ότι κόλλησες! Συνέχισε 'forward'.\n"
-        "2. ΠΡΑΓΜΑΤΙΚΟ ΚΟΛΛΗΜΑ: Κόλλημα υπάρχει ΜΟΝΟ όταν είσαι προσκρουσμένος ακριβώς πάνω σε εμπόδιο/τοίχο/έπιπλο "
-        "και δίνεις 'forward' χωρίς καμία απολύτως αλλαγή, ή αν η κάμερα δείχνει απόλυτα σκοτεινή/μπλοκαρισμένη εικόνα.\n"
-        "3. Αν δεν βλέπεις καθαρά το πάτωμα μπροστά σου, χρησιμοποίησε 'tiltdown' πριν δώσεις 'forward'.\n"
-        "4. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο 'reason'. Αν ο στόχος ολοκληρώθηκε, βάλε done=True."
+        "ΚΑΝΟΝΕΣ ΠΑΡΚΑΡΙΣΜΑΤΟΣ & ΚΙΝΗΣΗΣ:\n"
+        "1. Αν ο στόχος αφορά παρκάρισμα/προσέγγιση βάσης, κάνε πολύ μικρά βήματα.\n"
+        "2. Αν δεν βλέπεις καθαρά το πάτωμα μπροστά σου, χρησιμοποίησε 'tiltdown' πριν δώσεις 'forward'.\n"
+        "3. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο 'reason'. Αν ο στόχος ολοκληρώθηκε, βάλε done=True."
     )
 
     frame_buffer = []
@@ -473,9 +490,9 @@ def ai_worker(goal):
                 contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
 
             prompt_text = (
-                f"Σου στέλνω τις {len(frame_buffer)} τελευταίες διαδοχικές εικόνες από την κάμερα. "
+                f"Σου στέλνω τις {len(frame_buffer)} τελευταίες διαδοχικές εικόνες. "
                 f"Στόχος: {goal}. "
-                "Αξιολόγησε τον ελεύθερο χώρο, θυμήσου ότι η ευθεία πορεία διατηρεί παρόμοιο πλάνο, και αποφάσισε την επόμενη κίνηση."
+                f"Parking Mode: {'ON' if parking_mode else 'OFF'}. Αποφάσισε την επόμενη εντολή."
             )
             contents.append(prompt_text)
 
@@ -518,10 +535,11 @@ def video_feed():
 
 @app.route("/status")
 def status():
-    global ai_running, log_lines
+    global ai_running, log_lines, parking_mode
     return jsonify({
         "running": ai_running, 
-        "logs": "<br>".join(log_lines)
+        "logs": "<br>".join(log_lines),
+        "parking_mode": parking_mode
     })
 
 @app.route("/cmd", methods=["POST"])
@@ -547,6 +565,14 @@ def control_var():
     control(var_name, val)
     add_log(f"⚙️ Ρύθμιση αποστάλθηκε: var={var_name}&val={val}")
     return jsonify({"status": "success", "var": var_name, "val": val})
+
+@app.route("/parking_toggle", methods=["POST"])
+def parking_toggle():
+    global parking_mode
+    data = request.json
+    parking_mode = data.get("active", False)
+    add_log(f"🎯 Parking Mode: {'ON' if parking_mode else 'OFF'}")
+    return jsonify({"parking_mode": parking_mode})
 
 @app.route("/ai_toggle", methods=["POST"])
 def ai_toggle():
