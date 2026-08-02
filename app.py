@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v2.3-speed-test-0.1"
+APP_VERSION = "v2.4-speed-test-0.01"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -102,7 +102,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Speed Test 0.1</title>
+    <title>Rover Cloud Control - Speed Test 0.01</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -568,8 +568,8 @@ def parking_toggle():
     parking_mode = data.get("active", False)
     
     if parking_mode:
-        control("speed", 0.1)
-        add_log("🎯 Parking Mode: ON (Speed=0.1, Micro-Pulse=30ms)")
+        control("speed", 0.01)
+        add_log("🎯 Parking Mode: ON (Speed=0.01, Micro-Pulse=30ms)")
     else:
         control("speed", current_speed)
         add_log(f"🎯 Parking Mode: OFF (Speed={current_speed})")
