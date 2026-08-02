@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.9-latency-optimized"
+APP_VERSION = "v2.0-async-pulse-fix"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -34,54 +34,64 @@ class RoverDecision(BaseModel):
     done: bool = Field(description="True αν ο στόχος ολοκληρώθηκε")
     reason: str = Field(description="Σύντομη αιτιολόγηση στα ελληνικά")
 
-def control(var: str, val) -> None:
+def control_async(var: str, val) -> None:
+    """Ασύγχρονη αποστολή HTTP αιτήματος χωρίς αναμονή response (Fire-and-Forget)
+    για παράκαμψη του Network Latency."""
+    url = f"{CONTROL_BASE}/control?var={var}&val={val}"
+    def _send():
+        try:
+            requests.get(url, timeout=1.5)
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
+
+def control_sync(var: str, val) -> None:
+    """Συγχρονισμένη αποστολή για ρυθμίσεις (π.χ. speed, flash)"""
     url = f"{CONTROL_BASE}/control?var={var}&val={val}"
     try:
         _session.get(url, timeout=2)
     except requests.RequestException:
         pass
 
-def car(command: str) -> None:
+def car_async(command: str) -> None:
     if command in CAR_VALS:
-        control("car", CAR_VALS[command])
+        control_async("car", CAR_VALS[command])
 
 def execute_pulse(cmd: str):
-    """Εκτέλεση pulse χωρίς έξτρα HTTP overhead"""
+    """Εκτέλεση αληθινού Pulse 20-30ms χωρίς να μπλοκάρει από το δίκτυο"""
     global parking_mode, current_speed
     
-    # Αν είμαστε σε Parking Mode, ο χρόνος sleep είναι μηδενικός 
-    # ώστε η διάρκεια κίνησης να εξαρτάται ΑΠΟΚΛΕΙΣΤΙΚΑ από τη χαμηλή τάση του ESP32
     if parking_mode:
-        move_time = 0.01
-        turn_time = 0.01
+        move_time = 0.02  # 20 milliseconds
+        turn_time = 0.015 # 15 milliseconds
     else:
         spd = max(0, min(12, current_speed))
-        move_time = 0.05 + (spd / 12.0) * 0.15
-        turn_time = 0.03 + (spd / 12.0) * 0.10
-    
+        move_time = 0.03 + (spd / 12.0) * 0.15
+        turn_time = 0.02 + (spd / 12.0) * 0.10
+
     if cmd in ("forward", "backward"):
-        car(cmd)
-        time.sleep(move_time)
-        car("stop")
+        car_async(cmd)          # Στέλνει START αμέσως
+        time.sleep(move_time)   # Περιμένει το επιθυμητό pulse
+        car_async("stop")       # Στέλνει STOP αμέσως
     elif cmd in ("left", "right"):
-        car(cmd)
+        car_async(cmd)
         time.sleep(turn_time)
-        car("stop")
+        car_async("stop")
     else:
-        car("stop")
+        car_async("stop")
 
 def execute_rover_action(cmd: str):
     """Εκτελεί όλες τις διαθέσιμες ενέργειες (κίνηση + tilt κάμερας)"""
     if cmd in ("forward", "backward", "left", "right", "stop"):
         execute_pulse(cmd)
     elif cmd == "tiltup":
-        control("ltrim", 1)
+        control_async("ltrim", 1)
         add_log("📷 Κλίση Κάμερας: ΠΑΝΩ (tiltup)")
-        time.sleep(0.2)
+        time.sleep(0.1)
     elif cmd == "tiltdown":
-        control("rtrim", 1)
+        control_async("rtrim", 1)
         add_log("📷 Κλίση Κάμερας: ΚΑΤΩ (tiltdown)")
-        time.sleep(0.2)
+        time.sleep(0.1)
 
 def get_frame() -> bytes:
     try:
@@ -99,7 +109,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Latency Optimized</title>
+    <title>Rover Cloud Control - Async Micro-Pulses</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -554,7 +564,7 @@ def control_var():
         except ValueError:
             pass
 
-    control(var_name, val)
+    control_sync(var_name, val)
     add_log(f"⚙️ Ρύθμιση αποστάλθηκε: var={var_name}&val={val}")
     return jsonify({"status": "success", "var": var_name, "val": val})
 
@@ -565,12 +575,10 @@ def parking_toggle():
     parking_mode = data.get("active", False)
     
     if parking_mode:
-        # Στέλνει ΜΙΑ ΦΟΡΑ στο ESP32 τη χαμηλή ταχύτητα (speed=2)
-        control("speed", 2)
-        add_log("🎯 Parking Mode: ON (Ταχύτητα ESP32 ρυθμίστηκε στο 2)")
+        control_sync("speed", 1)
+        add_log("🎯 Parking Mode: ON (Ταχύτητα ESP32 ρυθμίστηκε στο 1)")
     else:
-        # Επαναφέρει την κανονική ταχύτητα
-        control("speed", current_speed)
+        control_sync("speed", current_speed)
         add_log(f"🎯 Parking Mode: OFF (Επαναφορά ταχύτητας ESP32 στο {current_speed})")
         
     return jsonify({"parking_mode": parking_mode})
