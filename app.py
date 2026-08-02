@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.8-parking-precision"
+APP_VERSION = "v1.9-latency-optimized"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -19,7 +19,7 @@ MODEL = "gemini-robotics-er-2-preview"
 CAR_VALS = {"forward": 1, "backward": 2, "left": 3, "right": 4, "stop": 5}
 
 current_speed = 6
-parking_mode = False  # Νέα λειτουργία ακριβείας για παρκάρισμα
+parking_mode = False
 _session = requests.Session()
 
 ai_thread = None
@@ -37,7 +37,7 @@ class RoverDecision(BaseModel):
 def control(var: str, val) -> None:
     url = f"{CONTROL_BASE}/control?var={var}&val={val}"
     try:
-        _session.get(url, timeout=3)
+        _session.get(url, timeout=2)
     except requests.RequestException:
         pass
 
@@ -45,27 +45,19 @@ def car(command: str) -> None:
     if command in CAR_VALS:
         control("car", CAR_VALS[command])
 
-def get_pulse_durations():
-    """Υπολογισμός χρόνων κίνησης με υποστήριξη Ultra-Precision Parking Mode"""
-    global current_speed, parking_mode
-    
-    if parking_mode:
-        # Εξαιρετικά μικρές κινήσεις (20-30ms) για παρκάρισμα ακριβείας
-        return 0.03, 0.02
-        
-    spd = max(0, min(12, current_speed))
-    # Γραμμική κλίμακα από 30ms (speed 0) έως 230ms (speed 12)
-    move_time = 0.03 + (spd / 12.0) * 0.20
-    turn_time = 0.02 + (spd / 12.0) * 0.12
-    return move_time, turn_time
-
 def execute_pulse(cmd: str):
-    global parking_mode
-    move_time, turn_time = get_pulse_durations()
+    """Εκτέλεση pulse χωρίς έξτρα HTTP overhead"""
+    global parking_mode, current_speed
     
-    # Αν είμαστε σε Parking Mode, χαμηλώνουμε αυτόματα την τάση των μοτέρ στο ESP32
+    # Αν είμαστε σε Parking Mode, ο χρόνος sleep είναι μηδενικός 
+    # ώστε η διάρκεια κίνησης να εξαρτάται ΑΠΟΚΛΕΙΣΤΙΚΑ από τη χαμηλή τάση του ESP32
     if parking_mode:
-        control("speed", 1)
+        move_time = 0.01
+        turn_time = 0.01
+    else:
+        spd = max(0, min(12, current_speed))
+        move_time = 0.05 + (spd / 12.0) * 0.15
+        turn_time = 0.03 + (spd / 12.0) * 0.10
     
     if cmd in ("forward", "backward"):
         car(cmd)
@@ -85,15 +77,15 @@ def execute_rover_action(cmd: str):
     elif cmd == "tiltup":
         control("ltrim", 1)
         add_log("📷 Κλίση Κάμερας: ΠΑΝΩ (tiltup)")
-        time.sleep(0.3)
+        time.sleep(0.2)
     elif cmd == "tiltdown":
         control("rtrim", 1)
         add_log("📷 Κλίση Κάμερας: ΚΑΤΩ (tiltdown)")
-        time.sleep(0.3)
+        time.sleep(0.2)
 
 def get_frame() -> bytes:
     try:
-        r = _session.get(CAPTURE_URL, timeout=4)
+        r = _session.get(CAPTURE_URL, timeout=3)
         r.raise_for_status()
         if r.content.startswith(b"\xff\xd8"):
             return r.content
@@ -107,7 +99,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Precision Parking</title>
+    <title>Rover Cloud Control - Latency Optimized</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -568,10 +560,19 @@ def control_var():
 
 @app.route("/parking_toggle", methods=["POST"])
 def parking_toggle():
-    global parking_mode
+    global parking_mode, current_speed
     data = request.json
     parking_mode = data.get("active", False)
-    add_log(f"🎯 Parking Mode: {'ON' if parking_mode else 'OFF'}")
+    
+    if parking_mode:
+        # Στέλνει ΜΙΑ ΦΟΡΑ στο ESP32 τη χαμηλή ταχύτητα (speed=2)
+        control("speed", 2)
+        add_log("🎯 Parking Mode: ON (Ταχύτητα ESP32 ρυθμίστηκε στο 2)")
+    else:
+        # Επαναφέρει την κανονική ταχύτητα
+        control("speed", current_speed)
+        add_log(f"🎯 Parking Mode: OFF (Επαναφορά ταχύτητας ESP32 στο {current_speed})")
+        
     return jsonify({"parking_mode": parking_mode})
 
 @app.route("/ai_toggle", methods=["POST"])
