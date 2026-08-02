@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.2-live-voice"
+APP_VERSION = "v1.3-safety-fixed"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -257,7 +257,6 @@ HTML_TEMPLATE = """
                     msgBox.scrollTop = msgBox.scrollHeight;
                 }
                 
-                // Φωνητική εκπομπή των νέων αποφάσεων του Gemini
                 if(data.last_reason && data.last_reason !== lastSpokenLog) {
                     lastSpokenLog = data.last_reason;
                     speakText(data.last_reason);
@@ -276,7 +275,6 @@ HTML_TEMPLATE = """
             });
         }, 1000);
 
-        // --- LIPS & VOICE (Text To Speech) ---
         function speakText(text) {
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
@@ -287,7 +285,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // --- LIVE MIC ENGINE (Continuous Speech Recognition) ---
         function toggleLiveVoice() {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) {
@@ -428,11 +425,16 @@ def ai_worker(goal):
         return
 
     client = genai.Client(api_key=api_key)
+    
+    # --- ΕΝΙΣΧΥΜΕΝΟ SYSTEM PROMPT ΓΙΑ ΑΥΣΤΗΡΗ ΑΠΟΦΥΓΗ ΕΜΠΟΔΙΩΝ ---
     system_prompt = (
-        "Είσαι το ρομπότ rover. Πρόχώρα 'forward' αν ο δρόμος είναι ελεύθερος. "
-        "Θυμήσου τις προηγούμενες κινήσεις σου και ΜΗΝ επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη. "
-        "Δώσε μια πολύ σύντομη αιτιολογία στα ελληνικά στο πεδίο reason. "
-        "Αν τελείωσες, βάλε done=True."
+        "Είσαι το ρομπότ rover. Η ΠΡΩΤΗ ΣΟΥ ΠΡΟΤΕΡΑΙΟΤΗΤΑ ΕΙΝΑΙ Η ΑΣΦΑΛΕΙΑ.\n"
+        "1. ΕΞΕΤΑΣΕ ΠΡΟΣΕΚΤΙΚΑ ΤΗΝ ΕΙΚΟΝΑ. Αν βλέπεις εμπόδιο, τοίχο, έπιπλο ή σκοτάδι από κοντά, "
+        "ΑΠΑΓΟΡΕΥΕΤΑΙ ΑΥΣΤΗΡΑ να δώσεις 'forward'.\n"
+        "2. Αν ο δρόμος είναι μπλοκαρισμένος, διάλεξε 'left', 'right' ή 'backward' για να ελευθερωθεί το πεδίο.\n"
+        "3. Δώσε 'forward' ΜΟΝΟ αν βλέπεις καθαρά ανοιχτό, ελεύθερο διάδρομο/χώρο.\n"
+        "4. Μην επαναλαμβάνεις κινήσεις που αναιρούν η μία την άλλη.\n"
+        "5. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο πεδίο reason. Αν τελείωσες τον στόχο, βάλε done=True."
     )
 
     try:
@@ -440,7 +442,7 @@ def ai_worker(goal):
             model=MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                temperature=0.3,
+                temperature=0.2, # Χαμηλότερη θερμοκρασία για πιο προσεκτικές αποφάσεις
                 response_mime_type="application/json",
                 response_schema=RoverDecision,
             )
@@ -456,7 +458,7 @@ def ai_worker(goal):
 
             contents = [
                 types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                f"Στόχος: {goal}. Αξιολόγησε την εικόνα."
+                f"Στόχος: {goal}. Έλεγξε πρώτα αν υπάρχει εμπόδιο μπροστά σου!"
             ]
 
             response = chat.send_message(contents)
