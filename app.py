@@ -1,7 +1,9 @@
 import os
 import time
 import threading
+import io
 import requests
+from PIL import Image
 from flask import Flask, render_template_string, request, jsonify
 from google import genai
 from google.genai import types
@@ -10,7 +12,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v1.4-full-tools"
+APP_VERSION = "v1.5-visual-stuck-detect"
 
 CONTROL_BASE = os.environ.get("ROVER_URL", "http://192.168.1.100")
 CAPTURE_URL = f"{CONTROL_BASE}/capture"          
@@ -95,13 +97,29 @@ def get_frame() -> bytes:
         pass
     return b""
 
+def is_image_stagnant(prev_bytes: bytes, curr_bytes: bytes, threshold: float = 7.0) -> bool:
+    """Συγκρίνει δύο εικόνες. Αν η μέση διαφορά pixels είναι πολύ μικρή, το ρομπότ ΔΕΝ μετακινήθηκε."""
+    if not prev_bytes or not curr_bytes:
+        return False
+    try:
+        img1 = Image.open(io.BytesIO(prev_bytes)).convert('L').resize((32, 32))
+        img2 = Image.open(io.BytesIO(curr_bytes)).convert('L').resize((32, 32))
+        
+        pixels1 = list(img1.getdata())
+        pixels2 = list(img2.getdata())
+        
+        diff = sum(abs(p1 - p2) for p1, p2 in zip(pixels1, pixels2)) / len(pixels1)
+        return diff < threshold
+    except Exception:
+        return False
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="el">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rover Cloud Control - Full Tools Mode</title>
+    <title>Rover Cloud Control - Visual Stuck Detect</title>
     <style>
         body { background-color: #121212; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 10px; }
         h2 { margin: 10px 0; font-size: 1.2rem; }
@@ -281,7 +299,7 @@ HTML_TEMPLATE = """
             });
         }, 1000);
 
-        // --- LIVE MIC ENGINE (Continuous Speech Recognition) ---
+        // --- LIVE MIC ENGINE ---
         function toggleLiveVoice() {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) {
@@ -423,22 +441,24 @@ def ai_worker(goal):
 
     client = genai.Client(api_key=api_key)
     
-    # --- ΕΝΙΣΧΥΜΕΝΟ SYSTEM PROMPT ΜΕ ΠΛΗΡΗ ΧΡΗΣΗ ΕΡΓΑΛΕΙΩΝ CAM TILT ---
     system_prompt = (
         "Είσαι το αυτόνομο ρομπότ rover. Η ΠΡΩΤΗ ΣΟΥ ΠΡΟΤΕΡΑΙΟΤΗΤΑ ΕΙΝΑΙ Η ΑΣΦΑΛΕΙΑ ΚΑΙ Η ΣΩΣΤΗ ΕΠΙΣΚΟΠΗΣΗ.\n\n"
         "ΔΙΑΘΕΣΙΜΕΣ ΕΝΤΟΛΕΣ (command):\n"
         "- 'forward': Προχώρα μπροστά (ΜΟΝΟ αν βλέπεις καθαρά ελεύθερο πάτωμα/διάδρομο).\n"
-        "- 'backward': Πίσω (αν είσαι πολύ κοντά σε εμπόδιο ή κόλλησες).\n"
+        "- 'backward': Πίσω (αν είσαι πολύ κοντά σε εμπόδιο, αν κόλλησες ή αν η προηγούμενη κίνηση απέτυχε).\n"
         "- 'left' / 'right': Στροφή.\n"
         "- 'stop': Σταμάτημα.\n"
         "- 'tiltdown': Γείρε την κάμερα ΚΑΤΩ για να ελέγξεις το πάτωμα και χαμηλά εμπόδια.\n"
         "- 'tiltup': Γείρε την κάμερα ΠΑΝΩ για να δεις τον υπόλοιπο χώρο.\n\n"
         "ΚΑΝΟΝΕΣ ΠΛΟΗΓΗΣΗΣ:\n"
-        "1. Αν δεν βλέπεις καθαρά το πάτωμα μπροστά σου (ή αν αμφιβάλεις), χρησιμοποίησε 'tiltdown' για να ελέγξεις πριν δώσεις 'forward'.\n"
-        "2. ΑΠΑΓΟΡΕΥΕΤΑΙ ΑΥΣΤΗΡΑ το 'forward' αν βλέπεις εμπόδιο, τοίχο, έπιπλο, ή αν η εικόνα είναι μπλοκαρισμένη/σκοτεινή.\n"
-        "3. Αν ο δρόμος είναι μπλοκαρισμένος, χρησιμοποίησε 'tiltdown' / 'tiltup' για να αξιολογήσεις ή 'left'/'right'/'backward' για να ελευθερωθείς.\n"
+        "1. Αν λάβεις προειδοποίηση ότι η εικόνα δεν άλλαξε, σημαίνει ότι ΚΟΛΛΗΣΕΣ ΦΥΣΙΚΑ! Πρέπει να δώσεις 'backward' ή 'left'/'right' για να ξεκολλήσεις.\n"
+        "2. Αν δεν βλέπεις καθαρά το πάτωμα μπροστά σου, χρησιμοποίησε 'tiltdown' για να ελέγξεις πριν δώσεις 'forward'.\n"
+        "3. ΑΠΑΓΟΡΕΥΕΤΑΙ ΑΥΣΤΗΡΑ το 'forward' αν βλέπεις εμπόδιο, τοίχο, έπιπλο, ή αν η εικόνα είναι μπλοκαρισμένη/σκοτεινή.\n"
         "4. Δώσε μια σύντομη αιτιολογία στα ελληνικά στο 'reason'. Αν ο στόχος ολοκληρώθηκε, βάλε done=True."
     )
+
+    prev_frame = None
+    last_executed_cmd = None
 
     try:
         chat = client.chats.create(
@@ -459,9 +479,22 @@ def ai_worker(goal):
                 time.sleep(2)
                 continue
 
+            # ΟΠΤΙΚΟΣ ΕΛΕΓΧΟΣ ΚΟΛΛΗΜΑΤΟΣ (Visual Standstill Detection)
+            stuck_warning = ""
+            if last_executed_cmd in ("forward", "left", "right", "backward") and prev_frame is not None:
+                if is_image_stagnant(prev_frame, frame):
+                    add_log(f"⚠️ ΕΝΤΟΠΙΣΤΗΚΕ ΚΟΛΛΗΜΑ! Η εικόνα δεν άλλαξε μετά από [{last_executed_cmd.upper()}].")
+                    stuck_warning = f" ⚠️ ΠΡΟΣΟΧΗ: Η προηγούμενη κίνηση [{last_executed_cmd}] ΔΕΝ άλλαξε την εικόνα. Το ρομπότ είναι κολλημένο! Κάνε υποχώρηση (backward) ή άλλαξε κατεύθυνση."
+                    
+                    # Αυτόματη άμεση κίνηση διαφυγής
+                    execute_rover_action("backward")
+                    time.sleep(0.3)
+                    execute_rover_action("left")
+                    time.sleep(0.3)
+
             contents = [
                 types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                f"Στόχος: {goal}. Αξιολόγησε την εικόνα, έλεγξε το πάτωμα με tiltdown αν χρειάζεται και αποφάσισε."
+                f"Στόχος: {goal}.{stuck_warning} Αξιολόγησε την εικόνα και αποφάσισε την επόμενη κίνηση."
             ]
 
             response = chat.send_message(contents)
@@ -470,6 +503,9 @@ def ai_worker(goal):
             if result:
                 cmd = result.command
                 cmd = check_and_break_loop(cmd)
+                
+                prev_frame = frame
+                last_executed_cmd = cmd
                 
                 add_log(f"🤖 {result.reason} [{cmd.upper()}]")
                 execute_rover_action(cmd)
