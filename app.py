@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 app = Flask(__name__)
 
 # --- ΕΚΔΟΣΗ ΕΦΑΡΜΟΓΗΣ ---
-APP_VERSION = "v2.6-timeout-20m-no-stop"
+APP_VERSION = "v2.7-parking-speed-fix"
 
 # --- ΔΙΑΠΙΣΤΕΥΤΗΡΙΑ ΑΣΦΑΛΕΙΑΣ (ENVIRONMENT VARIABLES) ---
 WEB_USER = os.environ.get("WEB_USER", "admin")
@@ -611,6 +611,7 @@ def parking_toggle():
         control("speed", 0.01)
         add_log("🎯 Parking Mode: ON (Speed=0.01, Micro-Pulse=30ms)")
     else:
+        current_speed = 6
         control("speed", current_speed)
         add_log(f"🎯 Parking Mode: OFF (Speed={current_speed})")
         
